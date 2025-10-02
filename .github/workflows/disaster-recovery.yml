@@ -1,0 +1,281 @@
+name: Disaster Recovery Test
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Monday at 6 AM UTC
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to test'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - prod
+      test_type:
+        description: 'Type of DR test'
+        required: true
+        default: 'failover'
+        type: choice
+        options:
+        - failover
+        - backup-restore
+        - full-dr
+
+env:
+  AWS_REGION_PRIMARY: 'us-east-1'
+  AWS_REGION_SECONDARY: 'us-west-2'
+
+jobs:
+  dr-test-preparation:
+    name: DR Test Preparation
+    runs-on: ubuntu-latest
+    outputs:
+      test-id: ${{ steps.prep.outputs.test-id }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup test ID and notifications
+        id: prep
+        run: |
+          TEST_ID="dr-test-$(date +%Y%m%d-%H%M%S)"
+          echo "test-id=$TEST_ID" >> $GITHUB_OUTPUT
+          echo "Starting DR test: $TEST_ID"
+
+      - name: Notify start
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "🧪 Disaster Recovery Test Started",
+              attachments: [{
+                color: "warning",
+                fields: [{
+                  title: "Test ID",
+                  value: "${{ steps.prep.outputs.test-id }}",
+                  short: true
+                }, {
+                  title: "Environment",
+                  value: "${{ github.event.inputs.environment || 'staging' }}",
+                  short: true
+                }, {
+                  title: "Test Type",
+                  value: "${{ github.event.inputs.test_type || 'failover' }}",
+                  short: true
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  backup-test:
+    name: Backup and Restore Test
+    runs-on: ubuntu-latest
+    needs: [dr-test-preparation]
+    if: github.event.inputs.test_type == 'backup-restore' || github.event.inputs.test_type == 'full-dr'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Create DynamoDB backup
+        run: |
+          ./scripts/create-dynamodb-backup.sh ${{ github.event.inputs.environment || 'staging' }}
+
+      - name: Test backup restoration
+        run: |
+          ./scripts/test-backup-restore.sh ${{ github.event.inputs.environment || 'staging' }}
+
+      - name: Validate data integrity
+        run: |
+          ./scripts/validate-data-integrity.sh ${{ github.event.inputs.environment || 'staging' }}
+
+  failover-test:
+    name: Regional Failover Test
+    runs-on: ubuntu-latest
+    needs: [dr-test-preparation]
+    if: github.event.inputs.test_type == 'failover' || github.event.inputs.test_type == 'full-dr'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Get baseline metrics
+        run: |
+          ./scripts/get-baseline-metrics.sh ${{ github.event.inputs.environment || 'staging' }}
+
+      - name: Simulate primary region failure
+        run: |
+          ./scripts/simulate-region-failure.sh ${{ github.event.inputs.environment || 'staging' }} ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Wait for Route53 failover
+        run: |
+          ./scripts/wait-for-failover.sh ${{ github.event.inputs.environment || 'staging' }}
+
+      - name: Validate secondary region health
+        run: |
+          ./scripts/validate-secondary-region.sh ${{ github.event.inputs.environment || 'staging' }} ${{ env.AWS_REGION_SECONDARY }}
+
+      - name: Test application functionality
+        run: |
+          ./scripts/test-application-functions.sh ${{ github.event.inputs.environment || 'staging' }}
+
+      - name: Restore primary region
+        run: |
+          ./scripts/restore-primary-region.sh ${{ github.event.inputs.environment || 'staging' }} ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Wait for full recovery
+        run: |
+          ./scripts/wait-for-full-recovery.sh ${{ github.event.inputs.environment || 'staging' }}
+
+  network-partition-test:
+    name: Network Partition Test
+    runs-on: ubuntu-latest
+    needs: [dr-test-preparation]
+    if: github.event.inputs.test_type == 'full-dr'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Simulate network partition
+        run: |
+          ./scripts/simulate-network-partition.sh ${{ github.event.inputs.environment || 'staging' }}
+
+      - name: Test DynamoDB Global Tables consistency
+        run: |
+          ./scripts/test-dynamodb-consistency.sh ${{ github.event.inputs.environment || 'staging' }}
+
+      - name: Restore network connectivity
+        run: |
+          ./scripts/restore-network-connectivity.sh ${{ github.event.inputs.environment || 'staging' }}
+
+  load-test-during-dr:
+    name: Load Test During DR
+    runs-on: ubuntu-latest
+    needs: [failover-test]
+    if: always() && needs.failover-test.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Run load test
+        run: |
+          cd tests/load
+          k6 run --env ENVIRONMENT=${{ github.event.inputs.environment || 'staging' }} dr-load-test.js
+
+      - name: Upload load test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-load-test-results
+          path: tests/load/results/
+
+  dr-test-report:
+    name: DR Test Report
+    runs-on: ubuntu-latest
+    needs: [dr-test-preparation, backup-test, failover-test, network-partition-test, load-test-during-dr]
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate test report
+        run: |
+          ./scripts/generate-dr-report.sh ${{ needs.dr-test-preparation.outputs.test-id }}
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-test-report-${{ needs.dr-test-preparation.outputs.test-id }}
+          path: reports/
+
+      - name: Calculate test success rate
+        id: results
+        run: |
+          SUCCESS_COUNT=0
+          TOTAL_COUNT=0
+          
+          # Check each test result
+          if [[ "${{ needs.backup-test.result }}" == "success" || "${{ needs.backup-test.result }}" == "skipped" ]]; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          fi
+          TOTAL_COUNT=$((TOTAL_COUNT + 1))
+          
+          if [[ "${{ needs.failover-test.result }}" == "success" ]]; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          fi
+          TOTAL_COUNT=$((TOTAL_COUNT + 1))
+          
+          if [[ "${{ needs.network-partition-test.result }}" == "success" || "${{ needs.network-partition-test.result }}" == "skipped" ]]; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          fi
+          TOTAL_COUNT=$((TOTAL_COUNT + 1))
+          
+          if [[ "${{ needs.load-test-during-dr.result }}" == "success" || "${{ needs.load-test-during-dr.result }}" == "skipped" ]]; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          fi
+          TOTAL_COUNT=$((TOTAL_COUNT + 1))
+          
+          SUCCESS_RATE=$((SUCCESS_COUNT * 100 / TOTAL_COUNT))
+          echo "success-rate=$SUCCESS_RATE" >> $GITHUB_OUTPUT
+          echo "success-count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "total-count=$TOTAL_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Notify completion
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "${{ steps.results.outputs.success-rate >= 75 && '✅' || '❌' }} Disaster Recovery Test Completed",
+              attachments: [{
+                color: "${{ steps.results.outputs.success-rate >= 75 && 'good' || 'danger' }}",
+                fields: [{
+                  title: "Test ID",
+                  value: "${{ needs.dr-test-preparation.outputs.test-id }}",
+                  short: true
+                }, {
+                  title: "Success Rate",
+                  value: "${{ steps.results.outputs.success-rate }}% (${{ steps.results.outputs.success-count }}/${{ steps.results.outputs.total-count }})",
+                  short: true
+                }, {
+                  title: "Environment",
+                  value: "${{ github.event.inputs.environment || 'staging' }}",
+                  short: true
+                }, {
+                  title: "Test Type",
+                  value: "${{ github.event.inputs.test_type || 'failover' }}",
+                  short: true
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

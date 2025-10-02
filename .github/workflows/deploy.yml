@@ -1,0 +1,491 @@
+name: Multi-Region API Platform CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - destroy
+
+env:
+  TF_VERSION: '1.5.0'
+  AWS_REGION_PRIMARY: 'us-east-1'
+  AWS_REGION_SECONDARY: 'us-west-2'
+  DOCKER_REGISTRY: '${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIMARY }}.amazonaws.com'
+
+jobs:
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Checkov static analysis
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload Checkov scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+
+  terraform-validate:
+    name: Terraform Validation
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: |
+          cd terraform/environments/${{ matrix.environment }}
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        run: |
+          cd terraform/environments/${{ matrix.environment }}
+          terraform validate
+
+      - name: TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint --recursive
+
+  build-and-test:
+    name: Build and Test Application
+    runs-on: ubuntu-latest
+    needs: [security-scan, terraform-validate]
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: applications/api-service/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd applications/api-service
+          npm ci
+
+      - name: Run unit tests
+        run: |
+          cd applications/api-service
+          npm test
+
+      - name: Run integration tests
+        run: |
+          cd applications/api-service
+          npm run test:integration
+
+      - name: Generate test coverage
+        run: |
+          cd applications/api-service
+          npm run coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./applications/api-service/coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/multi-region-api
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./applications/api-service
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Terraform Init
+        run: |
+          cd terraform/environments/${{ matrix.environment }}
+          terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform/environments/${{ matrix.environment }}
+          terraform plan -var="container_image=${{ needs.build-and-test.outputs.image-tag }}" -out=tfplan
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: terraform/environments/${{ matrix.environment }}/tfplan
+
+      - name: Comment PR with plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/environments/${{ matrix.environment }}/tfplan.txt', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan (${{ matrix.environment }})
+              
+              \`\`\`
+              ${plan}
+              \`\`\``
+            });
+
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Deploy to Primary Region
+        run: |
+          cd terraform/environments/dev
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+      - name: Configure AWS credentials for Secondary Region
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_SECONDARY }}
+
+      - name: Deploy to Secondary Region
+        run: |
+          cd terraform/environments/dev
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+      - name: Run smoke tests
+        run: |
+          ./scripts/smoke-tests.sh dev
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-dev]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Deploy to Primary Region
+        run: |
+          cd terraform/environments/staging
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+      - name: Configure AWS credentials for Secondary Region
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_SECONDARY }}
+
+      - name: Deploy to Secondary Region
+        run: |
+          cd terraform/environments/staging
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+      - name: Run integration tests
+        run: |
+          ./scripts/integration-tests.sh staging
+
+      - name: Run load tests
+        run: |
+          ./scripts/load-tests.sh staging
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Deploy to Primary Region
+        run: |
+          cd terraform/environments/prod
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+      - name: Wait for health checks
+        run: |
+          ./scripts/wait-for-health.sh prod ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Configure AWS credentials for Secondary Region
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_SECONDARY }}
+
+      - name: Deploy to Secondary Region
+        run: |
+          cd terraform/environments/prod
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+      - name: Wait for health checks
+        run: |
+          ./scripts/wait-for-health.sh prod ${{ env.AWS_REGION_SECONDARY }}
+
+      - name: Run production smoke tests
+        run: |
+          ./scripts/smoke-tests.sh prod
+
+      - name: Notify deployment success
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: "🚀 Production deployment successful! Version: ${{ needs.build-and-test.outputs.image-tag }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify deployment failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: "❌ Production deployment failed! Version: ${{ needs.build-and-test.outputs.image-tag }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  manual-deployment:
+    name: Manual Deployment
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Deploy to Primary Region
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+      - name: Configure AWS credentials for Secondary Region
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_SECONDARY }}
+
+      - name: Deploy to Secondary Region
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}
+          terraform init
+          terraform apply -auto-approve -var="container_image=${{ needs.build-and-test.outputs.image-tag }}"
+
+  destroy-infrastructure:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Destroy Secondary Region
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}
+          terraform init
+          terraform destroy -auto-approve
+
+      - name: Configure AWS credentials for Primary Region
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION_PRIMARY }}
+
+      - name: Destroy Primary Region
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}
+          terraform init
+          terraform destroy -auto-approve
