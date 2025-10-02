@@ -1,1 +1,1 @@
-# Multi-Region-High-Availability-API-Platform-on-AWS
+# Multi-Region-High-Availability-API-Platform(AWS)
